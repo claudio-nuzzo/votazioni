@@ -152,10 +152,10 @@ export default {
 				if (!Array.isArray(punti) || punti.length === 0)
 					return rispostaJson({ error: "Nessun punto da caricare" }, 400, cors);
 
-				const statements = punti.map((p) =>
+				const statements = punti.map((p: any) =>
 					env.DB.prepare(
-						"INSERT INTO ordine_del_giorno (id, sessione_id, numero_punto, titolo, tipo_voto) VALUES (?, ?, ?, ?, ?)"
-					).bind(crypto.randomUUID(), corpo.sessionId, Number(p.numero), p.titolo, p.tipo)
+						"INSERT INTO ordine_del_giorno (id, sessione_id, numero_punto, titolo, tipo_voto, testo) VALUES (?, ?, ?, ?, ?, ?)"
+					).bind(crypto.randomUUID(), corpo.sessionId, Number(p.numero), p.titolo, p.tipo, p.testo ?? null)
 				);
 				await env.DB.batch(statements);
 				return rispostaJson({ success: true }, 200, cors);
@@ -342,6 +342,93 @@ export default {
 								: null,
 						risultatiMatematici: conteggio,
 						dettaglioNominale: infoPunto.tipo_voto === "PALESE" ? elencoNominale : null,
+					},
+					200,
+					cors
+				);
+			}
+
+			// ── 8. RESOCONTO COMPLETO DELLA SEDUTA (solo admin) ─────────────────
+			// Restituisce tutti i punti con esiti e dettagli, per il verbale.
+			if (path.startsWith("/api/resoconto/") && request.method === "GET") {
+				const sessionId = path.split("/").pop();
+				const utente = await identificaUtente(
+					request,
+					env,
+					url.searchParams.get("email") ?? undefined
+				);
+				if ("errore" in utente) return rispostaJson({ error: utente.errore }, 401, cors);
+				if (!isAdmin(utente.email, env))
+					return rispostaJson({ error: "Operazione riservata agli amministratori" }, 403, cors);
+
+				const sessione = (await env.DB.prepare(
+					"SELECT * FROM sessioni_collegio WHERE id = ?"
+				)
+					.bind(sessionId)
+					.first()) as any;
+				if (!sessione) return rispostaJson({ error: "Sessione non trovata" }, 404, cors);
+
+				const { results: punti } = await env.DB.prepare(
+					"SELECT * FROM ordine_del_giorno WHERE sessione_id = ? ORDER BY numero_punto ASC"
+				)
+					.bind(sessionId)
+					.all();
+
+				const presenti = (sessione.totale_presenti_rilevati as number) || 0;
+				const quorumRichiesto = presenti > 0 ? Math.floor(presenti / 2) + 1 : null;
+
+				// Elenco nominale dei presenti rilevati dal Meet (per il verbale)
+				const { results: elencoPresentiRighe } = await env.DB.prepare(
+					"SELECT email FROM presenti_sessione WHERE sessione_id = ? ORDER BY email ASC"
+				)
+					.bind(sessionId)
+					.all();
+				const elencoPresenti = (elencoPresentiRighe as unknown as { email: string }[]).map(
+					(r) => r.email
+				);
+
+				const dettagliPunti = [];
+				for (const p of punti as any[]) {
+					const { results: voti } = await env.DB.prepare(
+						"SELECT scelta, user_email FROM urna_voti WHERE punto_id = ?"
+					)
+						.bind(p.id)
+						.all();
+					const conteggio: Record<string, number> = {
+						FAVOREVOLE: 0,
+						CONTRARIO: 0,
+						ASTENUTO: 0,
+					};
+					const elencoNominale: { email: string; scelta: string }[] = [];
+					for (const v of voti as unknown as { scelta: string; user_email: string }[]) {
+						conteggio[v.scelta]++;
+						if (p.tipo_voto === "PALESE")
+							elencoNominale.push({ email: v.user_email, scelta: v.scelta });
+					}
+					dettagliPunti.push({
+						numero: p.numero_punto,
+						titolo: p.titolo,
+						testo: p.testo ?? null,
+						tipoVoto: p.tipo_voto,
+						stato: p.stato,
+						votiTotali: voti.length,
+						risultati: conteggio,
+						valida: quorumRichiesto !== null && voti.length >= quorumRichiesto,
+						dettaglioNominale: p.tipo_voto === "PALESE" ? elencoNominale : null,
+					});
+				}
+
+				return rispostaJson(
+					{
+						titolo: sessione.titolo,
+						dataOra: sessione.data_ora,
+						meetLink: sessione.meet_link ?? null,
+						dominio: sessione.scuola_dominio ?? null,
+						presenti,
+						elencoPresenti,
+						quorumRichiesto,
+						generatoDa: utente.email,
+						punti: dettagliPunti,
 					},
 					200,
 					cors
