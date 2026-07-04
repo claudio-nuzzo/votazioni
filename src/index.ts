@@ -123,7 +123,9 @@ export default {
 				);
 			}
 
-			// ── 1. CREA SESSIONE DEL COLLEGIO (solo admin) ──────────────────────
+			// ── 1. CREA SEDUTA (solo admin) ─────────────────────────────────────
+			// Le sedute si preparano in anticipo: titolo, organo collegiale,
+			// data programmata e link Meet. Nascono in stato PREPARAZIONE.
 			if (path === "/api/sessione/crea" && request.method === "POST") {
 				const corpo = (await request.json()) as any;
 				const utente = await identificaUtente(request, env, corpo.userEmail);
@@ -131,13 +133,78 @@ export default {
 				if (!isAdmin(utente.email, env))
 					return rispostaJson({ error: "Operazione riservata agli amministratori" }, 403, cors);
 
+				if (!corpo.titolo) return rispostaJson({ error: "Titolo mancante" }, 400, cors);
+				const organo = ["COLLEGIO_DOCENTI", "CONSIGLIO_ISTITUTO", "ALTRO"].includes(corpo.organo)
+					? corpo.organo
+					: "COLLEGIO_DOCENTI";
+
 				const sessionId = crypto.randomUUID();
 				await env.DB.prepare(
-					"INSERT INTO sessioni_collegio (id, scuola_dominio, titolo, meet_link) VALUES (?, ?, ?, ?)"
+					"INSERT INTO sessioni_collegio (id, scuola_dominio, titolo, meet_link, organo, data_programmata, stato) VALUES (?, ?, ?, ?, ?, ?, 'PREPARAZIONE')"
 				)
-					.bind(sessionId, corpo.scuolaDominio ?? "", corpo.titolo, corpo.meetLink ?? null)
+					.bind(
+						sessionId,
+						corpo.scuolaDominio ?? "istitutostradivari.it",
+						corpo.titolo,
+						corpo.meetLink ?? null,
+						organo,
+						corpo.dataProgrammata ?? null
+					)
 					.run();
 				return rispostaJson({ success: true, sessionId }, 200, cors);
+			}
+
+			// ── 1b. ELENCO SEDUTE (solo admin) ──────────────────────────────────
+			if (path === "/api/sessioni/lista" && request.method === "GET") {
+				const utente = await identificaUtente(
+					request,
+					env,
+					url.searchParams.get("email") ?? undefined
+				);
+				if ("errore" in utente) return rispostaJson({ error: utente.errore }, 401, cors);
+				if (!isAdmin(utente.email, env))
+					return rispostaJson({ error: "Operazione riservata agli amministratori" }, 403, cors);
+
+				const { results } = await env.DB.prepare(
+					"SELECT s.id, s.titolo, s.organo, s.data_programmata, s.stato, s.meet_link, s.totale_presenti_rilevati, (SELECT COUNT(*) FROM ordine_del_giorno o WHERE o.sessione_id = s.id) AS num_punti FROM sessioni_collegio s ORDER BY COALESCE(s.data_programmata, s.data_ora) DESC"
+				).all();
+				return rispostaJson(results, 200, cors);
+			}
+
+			// ── 1c. AVVIA / CHIUDI SEDUTA (solo admin) ──────────────────────────
+			// Una sola seduta può essere IN_CORSO: è quella che vedono i docenti.
+			if (path === "/api/sessione/stato" && request.method === "POST") {
+				const corpo = (await request.json()) as any;
+				const utente = await identificaUtente(request, env, corpo.userEmail);
+				if ("errore" in utente) return rispostaJson({ error: utente.errore }, 401, cors);
+				if (!isAdmin(utente.email, env))
+					return rispostaJson({ error: "Operazione riservata agli amministratori" }, 403, cors);
+
+				if (!["PREPARAZIONE", "IN_CORSO", "CHIUSA"].includes(corpo.nuovoStato))
+					return rispostaJson({ error: "Stato seduta non valido" }, 400, cors);
+
+				if (corpo.nuovoStato === "IN_CORSO") {
+					await env.DB.batch([
+						env.DB.prepare("UPDATE sessioni_collegio SET stato = 'CHIUSA' WHERE stato = 'IN_CORSO'"),
+						env.DB.prepare("UPDATE sessioni_collegio SET stato = 'IN_CORSO' WHERE id = ?").bind(
+							corpo.sessionId
+						),
+					]);
+				} else {
+					await env.DB.prepare("UPDATE sessioni_collegio SET stato = ? WHERE id = ?")
+						.bind(corpo.nuovoStato, corpo.sessionId)
+						.run();
+				}
+				return rispostaJson({ success: true }, 200, cors);
+			}
+
+			// ── 1d. SEDUTA CORRENTE (pubblico) ──────────────────────────────────
+			// I docenti vedono automaticamente la seduta IN_CORSO.
+			if (path === "/api/sessione/corrente" && request.method === "GET") {
+				const s = await env.DB.prepare(
+					"SELECT id, titolo, organo, data_programmata, meet_link FROM sessioni_collegio WHERE stato = 'IN_CORSO' ORDER BY data_ora DESC LIMIT 1"
+				).first();
+				return rispostaJson(s ?? null, 200, cors);
 			}
 
 			// ── 2. CARICA I PUNTI DELL'ORDINE DEL GIORNO (solo admin) ───────────
@@ -421,7 +488,9 @@ export default {
 				return rispostaJson(
 					{
 						titolo: sessione.titolo,
+						organo: sessione.organo ?? "COLLEGIO_DOCENTI",
 						dataOra: sessione.data_ora,
+						dataProgrammata: sessione.data_programmata ?? null,
 						meetLink: sessione.meet_link ?? null,
 						dominio: sessione.scuola_dominio ?? null,
 						presenti,
