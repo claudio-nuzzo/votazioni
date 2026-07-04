@@ -6,7 +6,7 @@
 	"vars": {
 		"GOOGLE_CLIENT_ID": "465652157221-7utkqk1nq0avnh4caltbhibvbrd8eurp.apps.googleusercontent.com",
 		"DOMINIO_SCUOLA": "istitutostradivari.it",
-		"ADMIN_EMAILS": "nuzzo@istitutostradivari.it,porfido@istitutostradivari.it,caianiello@istitutostradivari.it,dirigente@istitutostradivari.it"
+		"ADMIN_EMAILS": "nuzzo@istitutostradivari.it,porfido@istitutostradivari.it,caianiello@istitutostradivari.it,dirigente@istitutostradivari.it,webmaster@istitutostradivari.it"
 	},
 	"d1_databases": [
 		{
