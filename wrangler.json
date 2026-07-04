@@ -3,6 +3,11 @@
 	"main": "src/index.ts",
 	"name": "votazioni",
 	"upload_source_maps": true,
+	"vars": {
+		"GOOGLE_CLIENT_ID": "",
+		"DOMINIO_SCUOLA": "istitutostradivari.it",
+		"ADMIN_EMAILS": "nuzzo@istitutostradivari.it"
+	},
 	"d1_databases": [
 		{
 			"binding": "DB",

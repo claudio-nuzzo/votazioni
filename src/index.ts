@@ -189,7 +189,9 @@ export default {
 				return rispostaJson({ success: true }, 200, cors);
 			}
 
-			// ── 5. REGISTRA IL NUMERO DEI PRESENTI (solo admin) ─────────────────
+			// ── 5. REGISTRA I PRESENTI DELLA SEDUTA (solo admin) ────────────────
+			// Oltre al numero, salva l'ELENCO delle email rilevate dal Meet:
+			// con il login Google attivo, solo chi è in elenco potrà votare.
 			if (path === "/api/sessione/presenti" && request.method === "POST") {
 				const corpo = (await request.json()) as any;
 				const utente = await identificaUtente(request, env, corpo.userEmail);
@@ -197,12 +199,26 @@ export default {
 				if (!isAdmin(utente.email, env))
 					return rispostaJson({ error: "Operazione riservata agli amministratori" }, 403, cors);
 
-				await env.DB.prepare(
-					"UPDATE sessioni_collegio SET totale_presenti_rilevati = ? WHERE id = ?"
-				)
-					.bind(Number(corpo.conteggioPresenti), corpo.sessionId)
-					.run();
-				return rispostaJson({ success: true }, 200, cors);
+				const emails: string[] = Array.isArray(corpo.emails)
+					? [...new Set((corpo.emails as string[]).map((e) => String(e).toLowerCase().trim()))]
+					: [];
+				const conteggio = emails.length > 0 ? emails.length : Number(corpo.conteggioPresenti) || 0;
+
+				const operazioni = [
+					env.DB.prepare(
+						"UPDATE sessioni_collegio SET totale_presenti_rilevati = ? WHERE id = ?"
+					).bind(conteggio, corpo.sessionId),
+					env.DB.prepare("DELETE FROM presenti_sessione WHERE sessione_id = ?").bind(
+						corpo.sessionId
+					),
+					...emails.map((e) =>
+						env.DB.prepare(
+							"INSERT INTO presenti_sessione (sessione_id, email) VALUES (?, ?)"
+						).bind(corpo.sessionId, e)
+					),
+				];
+				await env.DB.batch(operazioni);
+				return rispostaJson({ success: true, presenti: conteggio }, 200, cors);
 			}
 
 			// ── 6. VOTA ─────────────────────────────────────────────────────────
@@ -216,14 +232,39 @@ export default {
 
 				// Il tipo di voto e lo stato si leggono dal DATABASE (non dal client!)
 				const punto = (await env.DB.prepare(
-					"SELECT tipo_voto, stato FROM ordine_del_giorno WHERE id = ?"
+					"SELECT tipo_voto, stato, sessione_id FROM ordine_del_giorno WHERE id = ?"
 				)
 					.bind(corpo.puntoId)
-					.first()) as { tipo_voto: string; stato: string } | null;
+					.first()) as { tipo_voto: string; stato: string; sessione_id: string } | null;
 
 				if (!punto) return rispostaJson({ error: "Punto non trovato" }, 404, cors);
 				if (punto.stato !== "ATTIVO")
 					return rispostaJson({ error: "La votazione su questo punto non è aperta" }, 409, cors);
+
+				// Con il login Google attivo: può votare solo chi risulta tra i
+				// presenti della seduta (elenco incollato dal Meet dal Presidente).
+				if (env.GOOGLE_CLIENT_ID) {
+					const inElenco = await env.DB.prepare(
+						"SELECT 1 FROM presenti_sessione WHERE sessione_id = ? AND email = ?"
+					)
+						.bind(punto.sessione_id, utente.email)
+						.first();
+					if (!inElenco) {
+						const conta = (await env.DB.prepare(
+							"SELECT COUNT(*) as n FROM presenti_sessione WHERE sessione_id = ?"
+						)
+							.bind(punto.sessione_id)
+							.first()) as { n: number };
+						// L'elenco è stato caricato ma tu non ci sei → niente voto.
+						// (Se l'elenco è vuoto, si vota col solo controllo del dominio.)
+						if (conta.n > 0 && !isAdmin(utente.email, env))
+							return rispostaJson(
+								{ error: "Non risulti tra i presenti rilevati in questa seduta. Rivolgiti al Presidente." },
+								403,
+								cors
+							);
+					}
+				}
 
 				// Controllo doppio voto con messaggio chiaro
 				const giaVotato = await env.DB.prepare(
