@@ -92,6 +92,24 @@ async function identificaUtente(
 	return { email: info.email.toLowerCase() };
 }
 
+/**
+ * Restituisce le scelte ammesse per un punto: quelle personalizzate
+ * (es. nomi di candidati) più ASTENUTO, oppure le tre standard.
+ */
+function sceltePermesse(opzioniJson: string | null | undefined): string[] {
+	if (opzioniJson) {
+		try {
+			const opzioni = JSON.parse(opzioniJson);
+			if (Array.isArray(opzioni) && opzioni.length > 0) {
+				return [...opzioni.map((o) => String(o)), "ASTENUTO"];
+			}
+		} catch {
+			// JSON non valido: si torna alle opzioni standard
+		}
+	}
+	return ["FAVOREVOLE", "CONTRARIO", "ASTENUTO"];
+}
+
 /** Verifica se l'utente è un amministratore (presidente/segretario). */
 function isAdmin(email: string, env: Env): boolean {
 	if (!env.ADMIN_EMAILS) return true; // in modalità test tutti possono amministrare
@@ -198,6 +216,34 @@ export default {
 				return rispostaJson({ success: true }, 200, cors);
 			}
 
+			// ── 1e. ELIMINA SEDUTA (solo admin) ─────────────────────────────────
+			// Cancella la seduta con tutti i suoi punti, voti e presenze.
+			if (path === "/api/sessione/elimina" && request.method === "POST") {
+				const corpo = (await request.json()) as any;
+				const utente = await identificaUtente(request, env, corpo.userEmail);
+				if ("errore" in utente) return rispostaJson({ error: utente.errore }, 401, cors);
+				if (!isAdmin(utente.email, env))
+					return rispostaJson({ error: "Operazione riservata agli amministratori" }, 403, cors);
+
+				const esiste = await env.DB.prepare("SELECT 1 FROM sessioni_collegio WHERE id = ?")
+					.bind(corpo.sessionId)
+					.first();
+				if (!esiste) return rispostaJson({ error: "Seduta non trovata" }, 404, cors);
+
+				await env.DB.batch([
+					env.DB.prepare(
+						"DELETE FROM urna_voti WHERE punto_id IN (SELECT id FROM ordine_del_giorno WHERE sessione_id = ?)"
+					).bind(corpo.sessionId),
+					env.DB.prepare(
+						"DELETE FROM registro_votanti WHERE punto_id IN (SELECT id FROM ordine_del_giorno WHERE sessione_id = ?)"
+					).bind(corpo.sessionId),
+					env.DB.prepare("DELETE FROM ordine_del_giorno WHERE sessione_id = ?").bind(corpo.sessionId),
+					env.DB.prepare("DELETE FROM presenti_sessione WHERE sessione_id = ?").bind(corpo.sessionId),
+					env.DB.prepare("DELETE FROM sessioni_collegio WHERE id = ?").bind(corpo.sessionId),
+				]);
+				return rispostaJson({ success: true }, 200, cors);
+			}
+
 			// ── 1d. SEDUTA CORRENTE (pubblico) ──────────────────────────────────
 			// I docenti vedono automaticamente la seduta IN_CORSO.
 			if (path === "/api/sessione/corrente" && request.method === "GET") {
@@ -219,11 +265,20 @@ export default {
 				if (!Array.isArray(punti) || punti.length === 0)
 					return rispostaJson({ error: "Nessun punto da caricare" }, 400, cors);
 
-				const statements = punti.map((p: any) =>
-					env.DB.prepare(
-						"INSERT INTO ordine_del_giorno (id, sessione_id, numero_punto, titolo, tipo_voto, testo) VALUES (?, ?, ?, ?, ?, ?)"
-					).bind(crypto.randomUUID(), corpo.sessionId, Number(p.numero), p.titolo, p.tipo, p.testo ?? null)
-				);
+				const statements = punti.map((p: any) => {
+					// Opzioni personalizzate: elenco di scelte alternative
+					// (es. candidati). Se assente si vota Favorevole/Contrario/Astenuto.
+					let opzioni: string | null = null;
+					if (Array.isArray(p.opzioni)) {
+						const pulite = [
+							...new Set(p.opzioni.map((o: any) => String(o).trim()).filter((o: string) => o)),
+						].slice(0, 30);
+						if (pulite.length >= 2) opzioni = JSON.stringify(pulite);
+					}
+					return env.DB.prepare(
+						"INSERT INTO ordine_del_giorno (id, sessione_id, numero_punto, titolo, tipo_voto, testo, opzioni) VALUES (?, ?, ?, ?, ?, ?, ?)"
+					).bind(crypto.randomUUID(), corpo.sessionId, Number(p.numero), p.titolo, p.tipo, p.testo ?? null, opzioni);
+				});
 				await env.DB.batch(statements);
 				return rispostaJson({ success: true }, 200, cors);
 			}
@@ -294,19 +349,23 @@ export default {
 				const utente = await identificaUtente(request, env, corpo.userEmail);
 				if ("errore" in utente) return rispostaJson({ error: utente.errore }, 401, cors);
 
-				if (!["FAVOREVOLE", "CONTRARIO", "ASTENUTO"].includes(corpo.scelta))
-					return rispostaJson({ error: "Scelta non valida" }, 400, cors);
-
-				// Il tipo di voto e lo stato si leggono dal DATABASE (non dal client!)
+				// Il tipo di voto, lo stato e le opzioni si leggono dal DATABASE (non dal client!)
 				const punto = (await env.DB.prepare(
-					"SELECT tipo_voto, stato, sessione_id FROM ordine_del_giorno WHERE id = ?"
+					"SELECT tipo_voto, stato, sessione_id, opzioni FROM ordine_del_giorno WHERE id = ?"
 				)
 					.bind(corpo.puntoId)
-					.first()) as { tipo_voto: string; stato: string; sessione_id: string } | null;
+					.first()) as {
+					tipo_voto: string;
+					stato: string;
+					sessione_id: string;
+					opzioni: string | null;
+				} | null;
 
 				if (!punto) return rispostaJson({ error: "Punto non trovato" }, 404, cors);
 				if (punto.stato !== "ATTIVO")
 					return rispostaJson({ error: "La votazione su questo punto non è aperta" }, 409, cors);
+				if (!sceltePermesse(punto.opzioni).includes(corpo.scelta))
+					return rispostaJson({ error: "Scelta non valida" }, 400, cors);
 
 				// Con il login Google attivo: può votare solo chi risulta tra i
 				// presenti della seduta (elenco incollato dal Meet dal Presidente).
@@ -364,11 +423,11 @@ export default {
 			if (path.startsWith("/api/risultati/") && request.method === "GET") {
 				const puntoId = path.split("/").pop();
 				const infoPunto = (await env.DB.prepare(
-					"SELECT odg.tipo_voto, odg.stato, s.totale_presenti_rilevati FROM ordine_del_giorno odg JOIN sessioni_collegio s ON odg.sessione_id = s.id WHERE odg.id = ?"
+					"SELECT odg.tipo_voto, odg.stato, odg.opzioni, s.totale_presenti_rilevati FROM ordine_del_giorno odg JOIN sessioni_collegio s ON odg.sessione_id = s.id WHERE odg.id = ?"
 				)
 					.bind(puntoId)
 					.first()) as
-					| { tipo_voto: string; stato: string; totale_presenti_rilevati: number }
+					| { tipo_voto: string; stato: string; opzioni: string | null; totale_presenti_rilevati: number }
 					| null;
 
 				if (!infoPunto) return rispostaJson({ error: "Punto non trovato" }, 404, cors);
@@ -385,14 +444,12 @@ export default {
 				const votiTotali = voti.length;
 				const isValid = quorumRichiesto !== null && votiTotali >= quorumRichiesto;
 
-				const conteggio: Record<string, number> = {
-					FAVOREVOLE: 0,
-					CONTRARIO: 0,
-					ASTENUTO: 0,
-				};
+				const opzioniVoto = sceltePermesse(infoPunto.opzioni);
+				const conteggio: Record<string, number> = {};
+				for (const o of opzioniVoto) conteggio[o] = 0;
 				const elencoNominale: { email: string; scelta: string }[] = [];
 				for (const v of voti as unknown as { scelta: string; user_email: string }[]) {
-					conteggio[v.scelta]++;
+					conteggio[v.scelta] = (conteggio[v.scelta] ?? 0) + 1;
 					if (infoPunto.tipo_voto === "PALESE")
 						elencoNominale.push({ email: v.user_email, scelta: v.scelta });
 				}
@@ -400,6 +457,7 @@ export default {
 				return rispostaJson(
 					{
 						valida: isValid,
+						opzioniVoto,
 						votiTotali,
 						presentiNecessari: quorumRichiesto,
 						totalePresentiMeet: presenti,
@@ -461,14 +519,12 @@ export default {
 					)
 						.bind(p.id)
 						.all();
-					const conteggio: Record<string, number> = {
-						FAVOREVOLE: 0,
-						CONTRARIO: 0,
-						ASTENUTO: 0,
-					};
+					const opzioniVoto = sceltePermesse(p.opzioni);
+					const conteggio: Record<string, number> = {};
+					for (const o of opzioniVoto) conteggio[o] = 0;
 					const elencoNominale: { email: string; scelta: string }[] = [];
 					for (const v of voti as unknown as { scelta: string; user_email: string }[]) {
-						conteggio[v.scelta]++;
+						conteggio[v.scelta] = (conteggio[v.scelta] ?? 0) + 1;
 						if (p.tipo_voto === "PALESE")
 							elencoNominale.push({ email: v.user_email, scelta: v.scelta });
 					}
@@ -477,6 +533,7 @@ export default {
 						titolo: p.titolo,
 						testo: p.testo ?? null,
 						tipoVoto: p.tipo_voto,
+						opzioniVoto,
 						stato: p.stato,
 						votiTotali: voti.length,
 						risultati: conteggio,
