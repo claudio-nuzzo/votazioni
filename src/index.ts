@@ -305,9 +305,20 @@ export default {
 				if (!["IN_ATTESA", "ATTIVO", "CHIUSO"].includes(corpo.nuovoStato))
 					return rispostaJson({ error: "Stato non valido" }, 400, cors);
 
-				await env.DB.prepare("UPDATE ordine_del_giorno SET stato = ? WHERE id = ?")
-					.bind(corpo.nuovoStato, corpo.puntoId)
-					.run();
+				if (corpo.nuovoStato === "ATTIVO") {
+					// All'apertura dell'urna si CONGELA il numero dei presenti:
+					// il quorum di questo punto resta quello di questo momento,
+					// anche se le presenze vengono aggiornate in seguito.
+					await env.DB.prepare(
+						"UPDATE ordine_del_giorno SET stato = ?, presenti_al_voto = (SELECT totale_presenti_rilevati FROM sessioni_collegio WHERE id = ordine_del_giorno.sessione_id) WHERE id = ?"
+					)
+						.bind(corpo.nuovoStato, corpo.puntoId)
+						.run();
+				} else {
+					await env.DB.prepare("UPDATE ordine_del_giorno SET stato = ? WHERE id = ?")
+						.bind(corpo.nuovoStato, corpo.puntoId)
+						.run();
+				}
 				return rispostaJson({ success: true }, 200, cors);
 			}
 
@@ -423,11 +434,11 @@ export default {
 			if (path.startsWith("/api/risultati/") && request.method === "GET") {
 				const puntoId = path.split("/").pop();
 				const infoPunto = (await env.DB.prepare(
-					"SELECT odg.tipo_voto, odg.stato, odg.opzioni, s.totale_presenti_rilevati FROM ordine_del_giorno odg JOIN sessioni_collegio s ON odg.sessione_id = s.id WHERE odg.id = ?"
+					"SELECT odg.tipo_voto, odg.stato, odg.opzioni, odg.presenti_al_voto, s.totale_presenti_rilevati FROM ordine_del_giorno odg JOIN sessioni_collegio s ON odg.sessione_id = s.id WHERE odg.id = ?"
 				)
 					.bind(puntoId)
 					.first()) as
-					| { tipo_voto: string; stato: string; opzioni: string | null; totale_presenti_rilevati: number }
+					| { tipo_voto: string; stato: string; opzioni: string | null; presenti_al_voto: number | null; totale_presenti_rilevati: number }
 					| null;
 
 				if (!infoPunto) return rispostaJson({ error: "Punto non trovato" }, 404, cors);
@@ -438,7 +449,9 @@ export default {
 					.bind(puntoId)
 					.all();
 
-				const presenti = infoPunto.totale_presenti_rilevati || 0;
+				// Presenti congelati all'apertura dell'urna; per i punti votati
+				// prima di questo aggiornamento si usa il valore della seduta.
+				const presenti = infoPunto.presenti_al_voto ?? (infoPunto.totale_presenti_rilevati || 0);
 				// Quorum deliberativo: metà dei presenti + 1 (corretto anche per numeri pari)
 				const quorumRichiesto = presenti > 0 ? Math.floor(presenti / 2) + 1 : null;
 				const votiTotali = voti.length;
@@ -528,6 +541,9 @@ export default {
 						if (p.tipo_voto === "PALESE")
 							elencoNominale.push({ email: v.user_email, scelta: v.scelta });
 					}
+					// Quorum del punto: sui presenti congelati all'apertura dell'urna
+					const presentiPunto = p.presenti_al_voto ?? presenti;
+					const quorumPunto = presentiPunto > 0 ? Math.floor(presentiPunto / 2) + 1 : null;
 					dettagliPunti.push({
 						numero: p.numero_punto,
 						titolo: p.titolo,
@@ -536,8 +552,10 @@ export default {
 						opzioniVoto,
 						stato: p.stato,
 						votiTotali: voti.length,
+						presentiAlVoto: presentiPunto || null,
+						quorumPunto,
 						risultati: conteggio,
-						valida: quorumRichiesto !== null && voti.length >= quorumRichiesto,
+						valida: quorumPunto !== null && voti.length >= quorumPunto,
 						dettaglioNominale: p.tipo_voto === "PALESE" ? elencoNominale : null,
 					});
 				}
