@@ -119,6 +119,24 @@ function isAdmin(email: string, env: Env): boolean {
 		.includes(email.toLowerCase());
 }
 
+/**
+ * Registra un'operazione AMMINISTRATIVA nel registro operazioni
+ * (tracciabilità richiesta dall'Allegato tecnico, cap. 3.3 e 5).
+ * ATTENZIONE: non viene mai tracciata l'espressione dei voti,
+ * a tutela dell'anonimato del voto segreto.
+ */
+async function tracciaOperazione(env: Env, utente: string, azione: string, dettaglio: string) {
+	try {
+		await env.DB.prepare(
+			"INSERT INTO registro_operazioni (utente, azione, dettaglio) VALUES (?, ?, ?)"
+		)
+			.bind(utente, azione, dettaglio)
+			.run();
+	} catch {
+		// la tracciatura non deve mai bloccare l'operazione principale
+	}
+}
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const cors = headersCors(request);
@@ -169,6 +187,7 @@ export default {
 						corpo.dataProgrammata ?? null
 					)
 					.run();
+				await tracciaOperazione(env, utente.email, "CREAZIONE_SEDUTA", `"${corpo.titolo}" (${organo}) id=${sessionId}`);
 				return rispostaJson({ success: true, sessionId }, 200, cors);
 			}
 
@@ -213,6 +232,7 @@ export default {
 						.bind(corpo.nuovoStato, corpo.sessionId)
 						.run();
 				}
+				await tracciaOperazione(env, utente.email, "STATO_SEDUTA", `seduta ${corpo.sessionId} -> ${corpo.nuovoStato}`);
 				return rispostaJson({ success: true }, 200, cors);
 			}
 
@@ -241,6 +261,7 @@ export default {
 					env.DB.prepare("DELETE FROM presenti_sessione WHERE sessione_id = ?").bind(corpo.sessionId),
 					env.DB.prepare("DELETE FROM sessioni_collegio WHERE id = ?").bind(corpo.sessionId),
 				]);
+				await tracciaOperazione(env, utente.email, "ELIMINAZIONE_SEDUTA", `seduta ${corpo.sessionId}`);
 				return rispostaJson({ success: true }, 200, cors);
 			}
 
@@ -280,6 +301,7 @@ export default {
 					).bind(crypto.randomUUID(), corpo.sessionId, Number(p.numero), p.titolo, p.tipo, p.testo ?? null, opzioni);
 				});
 				await env.DB.batch(statements);
+				await tracciaOperazione(env, utente.email, "CARICAMENTO_PUNTI", `${punti.length} punti in seduta ${corpo.sessionId}`);
 				return rispostaJson({ success: true }, 200, cors);
 			}
 
@@ -319,6 +341,7 @@ export default {
 						.bind(corpo.nuovoStato, corpo.puntoId)
 						.run();
 				}
+				await tracciaOperazione(env, utente.email, "STATO_PUNTO", `punto ${corpo.puntoId} -> ${corpo.nuovoStato}`);
 				return rispostaJson({ success: true }, 200, cors);
 			}
 
@@ -351,6 +374,7 @@ export default {
 					),
 				];
 				await env.DB.batch(operazioni);
+				await tracciaOperazione(env, utente.email, "RILEVAZIONE_PRESENTI", `${conteggio} presenti per seduta ${corpo.sessionId}`);
 				return rispostaJson({ success: true, presenti: conteggio }, 200, cors);
 			}
 
@@ -560,6 +584,7 @@ export default {
 					});
 				}
 
+				await tracciaOperazione(env, utente.email, "ESTRAZIONE_RESOCONTO", `seduta ${sessionId}`);
 				return rispostaJson(
 					{
 						titolo: sessione.titolo,
